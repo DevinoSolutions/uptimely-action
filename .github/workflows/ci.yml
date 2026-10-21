@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and check dist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - name: Rebuild dist
+        run: npm run build
+      - name: Fail if dist is out of date
+        run: |
+          if [ -n "$(git status --porcelain dist)" ]; then
+            echo "::error::dist/ does not match the source. Run 'npm run build' and commit dist/."
+            git status --porcelain dist
+            git diff --stat dist
+            exit 1
+          fi
+
+  smoke:
+    # Runs the committed action itself with inputs that fail before any network
+    # call, proving dist/ loads on the runner's node24 runtime.
+    name: Action loads
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: bad
+        uses: ./
+        continue-on-error: true
+        with:
+          operation: not-an-operation
+          api-key: not-a-real-key
+      - name: Expect the unknown-operation failure
+        run: test "${{ steps.bad.outcome }}" = "failure"

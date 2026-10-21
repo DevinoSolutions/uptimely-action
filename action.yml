@@ -1,0 +1,93 @@
+name: "Uptimely Monitors"
+description: "Mute Uptimely monitors during a deploy, create a monitor per preview URL, and gate a job on a monitor being up."
+author: "Devino"
+branding:
+  icon: "activity"
+  color: "green"
+
+inputs:
+  operation:
+    description: "What to do: mute, unmute, create-preview-monitor, delete-monitor or check."
+    required: true
+  api-key:
+    description: "Uptimely project API key (uptimely_live_...). Store it as a repository secret."
+    required: true
+  api-url:
+    description: "Uptimely API base URL."
+    required: false
+    default: "https://app.getuptimely.com"
+
+  # mute / unmute
+  monitor-ids:
+    description: "mute/unmute: monitor ids, comma- or newline-separated."
+    required: false
+  labels:
+    description: "mute/unmute: label names; every monitor carrying one of them is selected. Combined with monitor-ids."
+    required: false
+  mute-minutes:
+    description: "mute: how long alerts stay muted (1-43200). The mute expires on its own even if unmute never runs."
+    required: false
+    default: "30"
+
+  # create-preview-monitor / delete-monitor / check
+  url:
+    description: "create-preview-monitor: the preview URL to monitor."
+    required: false
+  name:
+    description: "Monitor name. create-preview-monitor reuses a monitor with this name; delete-monitor and check look it up by name. Defaults to '<owner>/<repo> PR #<n> preview' on pull_request events."
+    required: false
+  monitor-type:
+    description: "create-preview-monitor: Website or API. delete-monitor: optional type filter for name lookups."
+    required: false
+  description:
+    description: "create-preview-monitor: monitor description."
+    required: false
+  monitoring-interval:
+    description: "create-preview-monitor: cron-shaped check cadence, e.g. '*/5 * * * *' (Uptimely default)."
+    required: false
+  failure-threshold:
+    description: "create-preview-monitor: consecutive failed checks before an incident (1-10, Uptimely default 2)."
+    required: false
+  monitor-id:
+    description: "delete-monitor / check: the monitor id (takes precedence over name)."
+    required: false
+
+  # check
+  timeout-seconds:
+    description: "check: fail if the monitor is not up within this many seconds."
+    required: false
+    default: "600"
+  interval-seconds:
+    description: "check: seconds between polls (min 5). Each poll is one request from the project's monthly API allowance."
+    required: false
+    default: "15"
+  up-statuses:
+    description: "check: status names that count as up, comma-separated."
+    required: false
+    default: "Operational"
+  stable-for-seconds:
+    description: "check: the monitor must stay up this long before the check passes. Set it to at least one check interval when gating on a just-created monitor, which starts out Operational before its first probe."
+    required: false
+    default: "0"
+
+outputs:
+  monitor-id:
+    description: "create-preview-monitor / delete-monitor / check: the monitor id."
+  monitor-ids:
+    description: "mute / unmute: comma-separated ids of the monitors that were muted / unmuted."
+  monitor-name:
+    description: "create-preview-monitor: the monitor name used."
+  created:
+    description: "create-preview-monitor: 'true' if a monitor was created, 'false' if an existing one was reused."
+  updated:
+    description: "create-preview-monitor: 'true' if a reused monitor's URL was updated to the new preview URL."
+  deleted:
+    description: "delete-monitor: 'true' if a monitor was deleted, 'false' if there was nothing to delete."
+  muted-until:
+    description: "mute: when the mute window ends (ISO-8601 UTC)."
+  status:
+    description: "check: the monitor's last observed status name."
+
+runs:
+  using: "node24"
+  main: "dist/index.js"

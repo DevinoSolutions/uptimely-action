@@ -1,0 +1,23 @@
+{
+  "name": "uptimely-action",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub Action for Uptimely: mute monitors during a deploy, create a monitor per preview URL, and gate a job on a monitor being up.",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "ncc build src/index.js -o dist --license licenses.txt",
+    "test": "vitest run",
+    "all": "npm test && npm run build"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.45.0",
+    "vitest": "^5.0.5"
+  }
+}
