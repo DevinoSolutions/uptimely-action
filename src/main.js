@@ -23,6 +23,14 @@ export function parseIntInput(name, value, { min, max, fallback }) {
   return n;
 }
 
+export function parseBoolInput(name, value, fallback) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (raw === "") return fallback;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new OperationError(`${name} must be true or false (got "${raw}").`);
+}
+
 /** Repository and pull-request number of the workflow run, when present. */
 export function readGithubContext(env = process.env) {
   let prNumber;
@@ -56,7 +64,7 @@ export function readInputs(getInput = core.getInput) {
       fallback: undefined,
     }),
     monitorId: getInput("monitor-id").trim(),
-    timeoutSeconds: parseIntInput("timeout-seconds", getInput("timeout-seconds"), { min: 1, max: 21600, fallback: 600 }),
+    timeoutSeconds: parseIntInput("timeout-seconds", getInput("timeout-seconds"), { min: 1, max: 21600, fallback: 900 }),
     intervalSeconds: parseIntInput("interval-seconds", getInput("interval-seconds"), { min: 5, max: 3600, fallback: 15 }),
     upStatuses: parseList(getInput("up-statuses")).length ? parseList(getInput("up-statuses")) : ["Operational"],
     stableForSeconds: parseIntInput("stable-for-seconds", getInput("stable-for-seconds"), {
@@ -64,6 +72,7 @@ export function readInputs(getInput = core.getInput) {
       max: 21600,
       fallback: 0,
     }),
+    waitForNewCheck: parseBoolInput("wait-for-new-check", getInput("wait-for-new-check"), true),
   };
 }
 
@@ -73,6 +82,16 @@ export function readInputs(getInput = core.getInput) {
 export async function run(deps = {}) {
   const c = deps.core ?? core;
   let outputs = {};
+  // Read first, so a failure anywhere below honours it. With fail-on-error
+  // false (meant for an `if: always()` unmute after a green deploy) an error
+  // becomes a warning and the step stays green.
+  let failOnError = true;
+  try {
+    failOnError = parseBoolInput("fail-on-error", c.getInput("fail-on-error"), true);
+  } catch (err) {
+    c.setFailed(err.message);
+    return;
+  }
   try {
     // Mask the key before anything else can log it.
     const rawKey = c.getInput("api-key");
@@ -103,7 +122,10 @@ export async function run(deps = {}) {
   } catch (err) {
     if (err instanceof OperationError) outputs = err.outputs;
     for (const [k, v] of Object.entries(outputs ?? {})) c.setOutput(k, v);
-    c.setFailed(err instanceof Error ? err.message : String(err));
+    const message = err instanceof Error ? err.message : String(err);
+    if (failOnError) c.setFailed(message);
+    else c.warning(`${message}
+(fail-on-error is false, so this step does not fail.)`);
     return;
   }
   for (const [k, v] of Object.entries(outputs)) c.setOutput(k, v);

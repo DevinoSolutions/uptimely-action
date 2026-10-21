@@ -1,8 +1,8 @@
 /**
  * A small client for Uptimely's public /v1 REST API.
  *
- * Auth is sent exactly as Uptimely's Zapier app sends it:
- * `Authorization: Bearer uptimely_live_…` plus `Accept: application/json`.
+ * Auth follows Uptimely's /v1 contract: `Authorization: Bearer uptimely_live_…`
+ * plus `Accept: application/json`.
  * /v1 only accepts project API keys (OAuth tokens are refused with 403
  * `unsupported_credential_type`), and every resource is scoped to the project
  * the key belongs to, so there is no project parameter anywhere.

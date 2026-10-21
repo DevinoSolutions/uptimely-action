@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { parseIntInput, parseList, readGithubContext, run } from "../src/main.js";
+import { parseBoolInput, parseIntInput, parseList, readGithubContext, run } from "../src/main.js";
 import { json, KEY, M1, M2, mockFetch, monitor, page, problem } from "./helpers.js";
 
 function fakeCore(inputs) {
@@ -31,7 +31,12 @@ afterAll(() => rmSync(tmp, { recursive: true, force: true }));
 
 describe("run()", () => {
   it("masks the API key before making any request", async () => {
-    const { core, state } = fakeCore({ operation: "check", "api-key": ` ${KEY} `, "monitor-id": M1 });
+    const { core, state } = fakeCore({
+      operation: "check",
+      "api-key": ` ${KEY} `,
+      "monitor-id": M1,
+      "wait-for-new-check": "false",
+    });
     const { fetchImpl, calls } = mockFetch({ [`GET /v1/monitors/${M1}`]: json(200, monitor(M1, "Web")) });
     const wrapped = async (...a) => {
       state.order.push("fetch");
@@ -87,12 +92,35 @@ describe("run()", () => {
     writeFileSync(eventPath, JSON.stringify({ action: "closed", pull_request: { number: 9 } }));
     const { core, state } = fakeCore({ operation: "delete-monitor", "api-key": KEY });
     const { fetchImpl } = mockFetch({
-      "GET /v1/monitors": page([monitor(M1, "acme/site PR #9 preview")]),
+      "GET /v1/monitors": page([monitor(M1, "acme/site PR #9 preview", { description: "x [uptimely-action:acme/site#9]" })]),
       [`DELETE /v1/monitors/${M1}`]: json(200, { id: M1, deleted: true }),
     });
     await run({ core, fetchImpl, env: { GITHUB_REPOSITORY: "acme/site", GITHUB_EVENT_PATH: eventPath } });
     expect(state.failed).toBeNull();
-    expect(state.outputs).toEqual({ "monitor-id": M1, deleted: "true" });
+    expect(state.outputs).toEqual({ "monitor-id": M1, "monitor-ids": M1, deleted: "true" });
+  });
+
+  it("with fail-on-error false, an unmute that still fails after retries warns instead of failing", async () => {
+    const { core, state } = fakeCore({ operation: "unmute", "api-key": KEY, "monitor-ids": M1, "fail-on-error": "false" });
+    const { fetchImpl, calls } = mockFetch({ [`DELETE /v1/monitors/${M1}/mute`]: problem(503, "internal_error", "down for maintenance") });
+    await run({ core, fetchImpl, sleep: async () => {}, env: {} });
+    expect(calls).toHaveLength(5); // first try + 4 retries
+    expect(state.failed).toBeNull();
+    expect(state.warning.at(-1)).toMatch(/Could not unmute 1 of 1[\s\S]*fail-on-error is false/);
+    expect(state.outputs).toEqual({ "monitor-ids": "" });
+  });
+
+  it("fails the step on the same error by default", async () => {
+    const { core, state } = fakeCore({ operation: "unmute", "api-key": KEY, "monitor-ids": M1 });
+    const { fetchImpl } = mockFetch({ [`DELETE /v1/monitors/${M1}/mute`]: problem(403, "feature_not_enabled", "Writes are off") });
+    await run({ core, fetchImpl, sleep: async () => {}, env: {} });
+    expect(state.failed).toMatch(/Writes are off/);
+  });
+
+  it("rejects a fail-on-error value that is not true or false", async () => {
+    const { core, state } = fakeCore({ operation: "unmute", "api-key": KEY, "fail-on-error": "maybe" });
+    await run({ core, env: {} });
+    expect(state.failed).toMatch(/fail-on-error must be true or false/);
   });
 });
 
@@ -107,6 +135,13 @@ describe("input parsing", () => {
     expect(parseIntInput("x", "4", { min: 1, max: 5 })).toBe(4);
     expect(() => parseIntInput("x", "9", { min: 1, max: 5 })).toThrow(/between 1 and 5/);
     expect(() => parseIntInput("x", "1.5", { min: 1, max: 5 })).toThrow(/whole number/);
+  });
+
+  it("parses booleans with a fallback", () => {
+    expect(parseBoolInput("x", "", true)).toBe(true);
+    expect(parseBoolInput("x", " FALSE ", true)).toBe(false);
+    expect(parseBoolInput("x", "true", false)).toBe(true);
+    expect(() => parseBoolInput("x", "yes", true)).toThrow(/true or false/);
   });
 
   it("reads the repository and PR number, tolerating a missing event file", () => {

@@ -28589,7 +28589,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   eF: () => (/* binding */ run)
 });
 
-// UNUSED EXPORTS: parseIntInput, parseList, readGithubContext, readInputs
+// UNUSED EXPORTS: parseBoolInput, parseIntInput, parseList, readGithubContext, readInputs
 
 // NAMESPACE OBJECT: ./node_modules/@actions/core/lib/platform.js
 var platform_namespaceObject = {};
@@ -31592,8 +31592,8 @@ function getIDToken(aud) {
 /**
  * A small client for Uptimely's public /v1 REST API.
  *
- * Auth is sent exactly as Uptimely's Zapier app sends it:
- * `Authorization: Bearer uptimely_live_…` plus `Accept: application/json`.
+ * Auth follows Uptimely's /v1 contract: `Authorization: Bearer uptimely_live_…`
+ * plus `Accept: application/json`.
  * /v1 only accepts project API keys (OAuth tokens are refused with 403
  * `unsupported_credential_type`), and every resource is scoped to the project
  * the key belongs to, so there is no project parameter anywhere.
@@ -31843,10 +31843,14 @@ function normalizeBaseUrl(value) {
  */
 
 
+
 const OPERATIONS = ["mute", "unmute", "create-preview-monitor", "delete-monitor", "check"];
 
 /** Monitor names are a 100-character column in Uptimely. */
 const MAX_MONITOR_NAME = 100;
+
+/** The config export caps descriptions at 500 characters, so ours stay within it. */
+const MAX_DESCRIPTION = 500;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PREVIEW_MONITOR_TYPES = new Set(["Website", "API"]);
@@ -31884,13 +31888,37 @@ function normalizeUrl(value) {
 
 /** Default name for a preview monitor: per pull request when there is one, else per URL. */
 function defaultPreviewName(github, url) {
-  const name =
-    github?.prNumber && github?.repository
-      ? `${github.repository} PR #${github.prNumber} preview`
-      : url
-        ? `Preview: ${url}`
-        : "";
-  return name.slice(0, MAX_MONITOR_NAME);
+  if (github?.prNumber && github?.repository) {
+    // Truncate the repository, never the suffix: the PR number is what keeps
+    // two pull requests' monitors apart.
+    const suffix = ` PR #${github.prNumber} preview`;
+    return github.repository.slice(0, Math.max(0, MAX_MONITOR_NAME - suffix.length)) + suffix;
+  }
+  return url ? `Preview: ${url}`.slice(0, MAX_MONITOR_NAME) : "";
+}
+
+/**
+ * The ownership marker stamped into the description of every monitor this
+ * action creates, e.g. `[uptimely-action:acme/web#42]`. Uptimely's create
+ * endpoint takes no labels, and the description is returned by both
+ * GET /v1/monitors and the config export, so it is where ownership lives.
+ * Name-based reuse, PATCH and delete only ever touch monitors carrying the
+ * marker for this repository and pull request. The closing bracket keeps
+ * `#4` from matching `#42`.
+ */
+function ownershipMarker(github) {
+  const repo = github?.repository || "";
+  if (!repo) return "[uptimely-action]";
+  return `[uptimely-action:${repo}${github?.prNumber ? `#${github.prNumber}` : ""}]`;
+}
+
+const isOwned = (m, marker) => typeof m?.description === "string" && m.description.includes(marker);
+
+/** Oldest first (created_at, then id), so every concurrent run picks the same survivor. */
+function byAge(a, b) {
+  const d = Date.parse(a.created_at) - Date.parse(b.created_at);
+  if (d) return d;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 /**
@@ -31959,6 +31987,10 @@ async function resolveSingleMonitor(client, inputs, github) {
   if (!name) throw new OperationError("Set monitor-id or name.");
   const found = await findByName(client, name);
   if (found.length === 0) throw new OperationError(`No monitor named "${name}" exists in this project.`);
+  // Reading is harmless, but when this action's own monitor shares the name
+  // with others, prefer it (the oldest copy, as create-preview-monitor keeps).
+  const owned = found.filter((m) => isOwned(m, ownershipMarker(github))).sort(byAge);
+  if (owned.length > 0) return owned[0].id;
   if (found.length > 1) {
     throw new OperationError(
       `${found.length} monitors are named "${name}" (${found.map((m) => m.id).join(", ")}); pass monitor-id to pick one.`,
@@ -32046,15 +32078,69 @@ async function unmute(ctx) {
 
 // ------------------------------------------------------ preview monitor lifecycle
 
+/** Who the marker says owns a monitor, for messages. */
+function ownerLabel(github) {
+  if (!github?.repository) return "this workflow";
+  return `${github.repository}${github.prNumber ? ` PR #${github.prNumber}` : ""}`;
+}
+
+/**
+ * The create Idempotency-Key, derived from the repository, the pull request
+ * and the exact request body (which carries the URL). Uptimely's ledger keys
+ * on (project, method, path, key) and refuses a reused key with a different
+ * body (422), so a key that hashes the body can only ever collapse identical
+ * requests: concurrent runs for the same PR and URL create ONE monitor, the
+ * others get a 409 `idempotency_in_progress` (retried) and then a replay of
+ * the same 201. The ledger keeps a key for 24 hours.
+ */
+function createIdempotencyKey(github, body, salt = "") {
+  const digest = (0,external_node_crypto_.createHash)("sha256")
+    .update(JSON.stringify(["create-preview-monitor", github?.repository || "", github?.prNumber || "", body, salt]))
+    .digest("hex");
+  return `uptimely-action-${digest}`;
+}
+
+/** Export entries carry (name, type, description) but no id; the list carries ids. */
+function exportedUrlOf(entries, m) {
+  const hits = entries.filter(
+    (e) => e.name === m.name && e.monitor_type === m.monitor_type && (e.description ?? null) === (m.description ?? null),
+  );
+  return hits.length === 1 ? hits[0].url : undefined;
+}
+
+async function readExport(client) {
+  const exported = await client.request("GET", "/v1/monitors/export");
+  return Array.isArray(exported?.monitors) ? exported.monitors : [];
+}
+
+/** Deletes every monitor in `extras`; a 404 means another run already did. */
+async function deleteDuplicates(client, log, extras, keptId) {
+  for (const m of extras) {
+    try {
+      await client.request("DELETE", monitorPath(m.id));
+      log.info(`Deleted duplicate preview monitor ${m.id} (kept ${keptId}).`);
+    } catch (err) {
+      if (!(err instanceof UptimelyApiError && err.status === 404)) throw err;
+    }
+  }
+}
+
 /**
  * Creates a monitor for a preview URL, or reuses the one a previous run made.
- * Reuse order: same name + type (and, if its URL changed, the URL is updated
- * so the monitor follows the newest preview deployment), else the same URL +
- * type. Only then is a monitor created, with an Idempotency-Key so a retried
- * POST cannot create it twice.
+ *
+ * Only monitors carrying this run's ownership marker (see ownershipMarker) are
+ * ever reused, re-pointed or deleted. A same-named monitor without the marker
+ * belongs to someone else: the step fails and leaves it alone.
+ *
+ * Reuse order: a marked monitor with the same name + type (its URL is updated
+ * when the preview moved), else a marked monitor of the same type already
+ * watching the URL. Only then is a monitor created, with a deterministic
+ * Idempotency-Key. Afterwards the list is read again and any newer marked
+ * copies (left by a concurrent run with a different URL) are deleted, keeping
+ * the oldest so every run converges on the same monitor.
  */
 async function createPreviewMonitor(ctx) {
-  const { client, inputs, log, github, randomUUID } = ctx;
+  const { client, inputs, log, github } = ctx;
   const url = inputs.url;
   if (!url) throw new OperationError("create-preview-monitor needs the url input.");
   try {
@@ -32068,105 +32154,187 @@ async function createPreviewMonitor(ctx) {
     throw new OperationError(`monitor-type must be "Website" or "API" for a preview URL (got "${monitorType}").`);
   }
   const name = (inputs.name || defaultPreviewName(github, url)).slice(0, MAX_MONITOR_NAME);
+  const marker = ownershipMarker(github);
+  const sameName = (m) => m.name === name && m.monitor_type === monitorType;
 
   const monitors = await client.listAll("/v1/monitors");
-  const byName = monitors.filter((m) => m.name === name && m.monitor_type === monitorType);
-  if (byName.length > 1) {
+  const foreign = monitors.filter((m) => sameName(m) && !isOwned(m, marker));
+  if (foreign.length > 0) {
     throw new OperationError(
-      `${byName.length} ${monitorType} monitors are named "${name}" (${byName.map((m) => m.id).join(", ")}); delete the extras or set a different name.`,
+      `A ${monitorType} monitor named "${name}" already exists (${foreign.map((m) => m.id).join(", ")}) but was not created by uptimely-action for ${ownerLabel(github)}: its description lacks the marker ${marker}. It was left untouched. Rename or delete it, or set a different name input.`,
     );
   }
+  let owned = monitors.filter((m) => sameName(m) && isOwned(m, marker));
+  let entries;
 
-  // URLs are only visible in the config export; ids only in the list.
-  const exported = await client.request("GET", "/v1/monitors/export");
-  const entries = Array.isArray(exported?.monitors) ? exported.monitors : [];
+  if (owned.length === 0) {
+    // A monitor this action made for the same PR under another name (the name
+    // input changed) that already watches the URL.
+    entries = await readExport(client);
+    const urlMatch = monitors
+      .filter((m) => m.monitor_type === monitorType && isOwned(m, marker))
+      .filter((m) => {
+        const current = exportedUrlOf(entries, m);
+        return current !== undefined && sameUrl(current, url);
+      })
+      .sort(byAge);
+    if (urlMatch.length > 0) {
+      const m = urlMatch[0];
+      log.info(`Reused monitor ${m.id} ("${m.name}"), which already watches ${url}.`);
+      return { "monitor-id": m.id, "monitor-name": m.name, created: "false", updated: "false" };
+    }
+  }
 
-  if (byName.length === 1) {
-    const existing = byName[0];
-    const entry = entries.find((e) => e.name === name && e.monitor_type === monitorType);
-    let updated = false;
-    if (entry && entry.url && !sameUrl(entry.url, url)) {
+  let createdId = "";
+  if (owned.length === 0) {
+    const base =
+      inputs.description ||
+      (github?.repository
+        ? `Preview monitor created by uptimely-action for ${ownerLabel(github)}.`
+        : "Preview monitor created by uptimely-action.");
+    const body = {
+      name,
+      monitor_type: monitorType,
+      url,
+      description: `${base.slice(0, MAX_DESCRIPTION - marker.length - 1)} ${marker}`,
+    };
+    if (inputs.monitoringInterval) body.monitoring_interval = inputs.monitoringInterval;
+    if (inputs.failureThreshold !== undefined) body.failure_threshold = inputs.failureThreshold;
+
+    let key = createIdempotencyKey(github, body);
+    for (let attempt = 0; ; attempt += 1) {
+      const created = await client.request("POST", "/v1/monitors", { body, idempotencyKey: key });
+      createdId = created.id;
+      owned = (await client.listAll("/v1/monitors")).filter((m) => sameName(m) && isOwned(m, marker));
+      if (owned.some((m) => m.id === createdId)) break;
+      // The key replayed a create from the last 24 hours whose monitor has
+      // since been deleted (e.g. the PR was closed and reopened). Derive a new
+      // key from the stale id, still deterministic so concurrent runs agree.
+      if (attempt > 0) {
+        throw new OperationError(`Uptimely reported monitor ${createdId} as created, but it is not in the monitor list.`);
+      }
+      log.info(`The Idempotency-Key replayed monitor ${createdId}, which no longer exists; creating a new one.`);
+      key = createIdempotencyKey(github, body, createdId);
+    }
+    log.info(`Created ${monitorType} monitor ${createdId} ("${name}") for ${url}.`);
+  }
+
+  owned.sort(byAge);
+  const keep = owned[0];
+  const extras = owned.slice(1);
+  if (extras.length > 0) {
+    await deleteDuplicates(client, log, extras, keep.id);
+    entries = undefined; // re-read: the export still listed the duplicates
+  }
+
+  let updated = false;
+  if (keep.id !== createdId) {
+    entries ??= await readExport(client);
+    const current = exportedUrlOf(entries, keep);
+    if (current !== undefined && !sameUrl(current, url)) {
       // PATCH sets absolute values, so repeating it is harmless: safe to retry.
-      await client.request("PATCH", monitorPath(existing.id), { body: { url }, retry: true });
+      await client.request("PATCH", monitorPath(keep.id), { body: { url }, retry: true });
       updated = true;
-      log.info(`Reused monitor ${existing.id} ("${name}") and pointed it at ${url} (was ${entry.url}).`);
+      log.info(`Reused monitor ${keep.id} ("${name}") and pointed it at ${url} (was ${current}).`);
     } else {
-      log.info(`Reused monitor ${existing.id} ("${name}").`);
-    }
-    return { "monitor-id": existing.id, "monitor-name": name, created: "false", updated: String(updated) };
-  }
-
-  const urlMatches = entries.filter((e) => e.monitor_type === monitorType && e.url && sameUrl(e.url, url));
-  for (const entry of urlMatches) {
-    const candidates = monitors.filter((m) => m.name === entry.name && m.monitor_type === monitorType);
-    if (candidates.length === 1) {
-      log.info(`Reused monitor ${candidates[0].id} ("${entry.name}"), which already watches ${url}.`);
-      return { "monitor-id": candidates[0].id, "monitor-name": entry.name, created: "false", updated: "false" };
+      log.info(`Reused monitor ${keep.id} ("${name}").`);
     }
   }
-
-  const body = { name, monitor_type: monitorType, url };
-  const description =
-    inputs.description ||
-    (github?.repository
-      ? `Preview monitor created by uptimely-action for ${github.repository}${github.prNumber ? ` PR #${github.prNumber}` : ""}.`
-      : "Preview monitor created by uptimely-action.");
-  body.description = description.slice(0, 1000);
-  if (inputs.monitoringInterval) body.monitoring_interval = inputs.monitoringInterval;
-  if (inputs.failureThreshold !== undefined) body.failure_threshold = inputs.failureThreshold;
-
-  const created = await client.request("POST", "/v1/monitors", { body, idempotencyKey: randomUUID() });
-  log.info(`Created ${monitorType} monitor ${created.id} ("${name}") for ${url}.`);
-  return { "monitor-id": created.id, "monitor-name": name, created: "true", updated: "false" };
+  return {
+    "monitor-id": keep.id,
+    "monitor-name": name,
+    created: String(keep.id === createdId),
+    updated: String(updated),
+  };
 }
 
 /**
- * Deletes a monitor by id, or by name (defaulting to the same per-PR name
- * create-preview-monitor uses). Missing is success with deleted=false, so a
- * cleanup step on PR close never fails because the monitor is already gone.
+ * Deletes a monitor by id, or every monitor this action made under a name
+ * (defaulting to the same per-PR name create-preview-monitor uses). By name,
+ * only monitors carrying this run's ownership marker are deleted. Nothing to
+ * delete is success with deleted=false, so a cleanup step on PR close never
+ * fails because the monitor is already gone.
  */
 async function deleteMonitor(ctx) {
   const { client, inputs, log, github } = ctx;
-  let id = inputs.monitorId ? assertMonitorId(inputs.monitorId) : "";
-  if (!id) {
+  let ids;
+  let foreign = [];
+  if (inputs.monitorId) {
+    ids = [assertMonitorId(inputs.monitorId)];
+  } else {
     const name = inputs.name || defaultPreviewName(github, inputs.url);
     if (!name) throw new OperationError("delete-monitor needs monitor-id or name.");
+    const marker = ownershipMarker(github);
     const found = await findByName(client, name, inputs.monitorType || undefined);
-    if (found.length === 0) {
+    foreign = found.filter((m) => !isOwned(m, marker));
+    ids = found
+      .filter((m) => isOwned(m, marker))
+      .sort(byAge)
+      .map((m) => m.id);
+    if (ids.length === 0) {
+      const none = { "monitor-id": "", "monitor-ids": "", deleted: "false" };
+      if (foreign.length > 0) {
+        throw new OperationError(
+          `Monitor(s) named "${name}" exist (${foreign.map((m) => m.id).join(", ")}) but none was created by uptimely-action for ${ownerLabel(github)} (no ${marker} marker in the description), so nothing was deleted. Pass monitor-id to delete one explicitly.`,
+          none,
+        );
+      }
       log.info(`No monitor named "${name}"; nothing to delete.`);
-      return { "monitor-id": "", deleted: "false" };
+      return none;
     }
-    if (found.length > 1) {
-      throw new OperationError(
-        `${found.length} monitors are named "${name}" (${found.map((m) => m.id).join(", ")}); pass monitor-id to pick one.`,
-      );
-    }
-    id = found[0].id;
   }
-  try {
-    await client.request("DELETE", monitorPath(id));
-  } catch (err) {
-    if (err instanceof UptimelyApiError && err.status === 404) {
-      log.info(`Monitor ${id} does not exist (already deleted).`);
-      return { "monitor-id": id, deleted: "false" };
+
+  const deleted = [];
+  const failures = [];
+  for (const id of ids) {
+    try {
+      await client.request("DELETE", monitorPath(id));
+      deleted.push(id);
+      log.info(`Deleted monitor ${id}.`);
+    } catch (err) {
+      if (err instanceof UptimelyApiError && err.status === 404) {
+        log.info(`Monitor ${id} does not exist (already deleted).`);
+        continue;
+      }
+      failures.push(`${id}: ${err.message}`);
     }
-    throw err;
   }
-  log.info(`Deleted monitor ${id}.`);
-  return { "monitor-id": id, deleted: "true" };
+  if (foreign.length > 0) {
+    log.warning(
+      `Left ${foreign.length} same-named monitor(s) without this run's ownership marker untouched: ${foreign.map((m) => m.id).join(", ")}.`,
+    );
+  }
+  const outputs = {
+    "monitor-id": deleted[0] ?? ids[0],
+    "monitor-ids": deleted.join(","),
+    deleted: String(deleted.length > 0),
+  };
+  if (failures.length > 0) {
+    throw new OperationError(`Could not delete ${failures.length} of ${ids.length} monitor(s):\n${failures.join("\n")}`, outputs);
+  }
+  return outputs;
 }
 
 // ------------------------------------------------------------------------ check
 
 /**
  * Polls GET /v1/monitors/{id} until the monitor's status is one of
- * `up-statuses` and has stayed so for `stable-for-seconds`, or fails at
- * `timeout-seconds`. Uptimely has no on-demand "check this URL now"
- * endpoint, so this observes the monitor's own probes.
+ * `up-statuses`, backed by a check Uptimely ran after this step started, and
+ * has stayed so for `stable-for-seconds`; or fails at `timeout-seconds`.
+ * Uptimely has no on-demand "check this URL now" endpoint, so this observes
+ * the monitor's own scheduled checks.
  *
- * Caveat: a monitor starts in its "Operational" status at creation, before
- * its first probe. When gating on a freshly created monitor, set
- * stable-for-seconds to at least one check interval.
+ * Why the wait for a new check: a monitor is created in the "Operational"
+ * state before its first probe, and a monitor whose URL was just changed
+ * keeps the status of its old URL until it is probed again. The API exposes
+ * no last-check time, but Uptimely's probe sweep writes the monitor's
+ * `updated_at` when it claims the monitor for a check and again once the
+ * result is recorded (monitor-runtime-service: listDueMonitorProbeTargets,
+ * advanceMonitorNextPingAt), while a PATCH leaves it alone. So two advances
+ * of `updated_at` after the first poll mean at least one check finished after
+ * the step started, and the status then reflects it.
+ * `wait-for-new-check: false` turns this off (e.g. for monitor types no probe
+ * checks, such as Manual or Incoming Request).
  */
 async function check(ctx) {
   const { client, inputs, log, sleep, now, github } = ctx;
@@ -32174,9 +32342,11 @@ async function check(ctx) {
   const up = new Set(inputs.upStatuses.map((s) => s.trim().toLowerCase()));
   const deadline = now() + inputs.timeoutSeconds * 1000;
   const stableMs = inputs.stableForSeconds * 1000;
+  const waitForCheck = inputs.waitForNewCheck !== false;
   let upSince = null;
   let lastStatus = "";
-  let warnedDisabled = false;
+  let lastUpdatedAt;
+  let writesSeen = 0;
 
   for (;;) {
     let monitor;
@@ -32191,13 +32361,25 @@ async function check(ctx) {
     const status = monitor?.status?.name ?? "";
     if (status !== lastStatus) log.info(`Monitor ${id} ("${monitor?.name ?? ""}") status: ${status || "unknown"}.`);
     lastStatus = status;
-    if (monitor?.active_monitoring_disabled && !warnedDisabled) {
-      warnedDisabled = true;
-      log.warning(`Monitor ${id} has active monitoring switched off, so its status will not change on its own.`);
+    if (monitor?.active_monitoring_disabled) {
+      throw new OperationError(
+        `Monitor ${id} has active monitoring switched off (paused, or inside a maintenance window), so Uptimely is not checking it and its status "${status || "unknown"}" proves nothing. Switch monitoring back on, or gate on another monitor.`,
+        { "monitor-id": id, status },
+      );
     }
 
+    const updatedAt = Date.parse(monitor?.updated_at ?? "");
+    if (lastUpdatedAt === undefined) {
+      lastUpdatedAt = updatedAt;
+    } else if (updatedAt > lastUpdatedAt) {
+      lastUpdatedAt = updatedAt;
+      writesSeen += 1;
+      if (waitForCheck && writesSeen === 2) log.info(`Monitor ${id} recorded a new check.`);
+    }
+    const checked = !waitForCheck || writesSeen >= 2;
+
     const t = now();
-    if (up.has(status.toLowerCase())) {
+    if (checked && up.has(status.toLowerCase())) {
       upSince ??= t;
       if (t - upSince >= stableMs) {
         return { "monitor-id": id, status };
@@ -32206,6 +32388,12 @@ async function check(ctx) {
       upSince = null;
     }
     if (t >= deadline) {
+      if (!checked) {
+        throw new OperationError(
+          `Monitor ${id} recorded no new check within ${inputs.timeoutSeconds}s, so its status ("${status || "unknown"}") may predate this run. Uptimely checks it on its own schedule (its monitoring interval, 5 minutes by default) and seeing a new check can take two intervals: set timeout-seconds to at least twice that interval, or set wait-for-new-check: false to accept the current status.`,
+          { "monitor-id": id, status },
+        );
+      }
       throw new OperationError(
         `Monitor ${id} was not ${[...inputs.upStatuses].join(" / ")}${stableMs ? ` for ${inputs.stableForSeconds}s` : ""} within ${inputs.timeoutSeconds}s; last status: ${status || "unknown"}.`,
         { "monitor-id": id, status },
@@ -32249,6 +32437,14 @@ function parseIntInput(name, value, { min, max, fallback }) {
   return n;
 }
 
+function parseBoolInput(name, value, fallback) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (raw === "") return fallback;
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  throw new OperationError(`${name} must be true or false (got "${raw}").`);
+}
+
 /** Repository and pull-request number of the workflow run, when present. */
 function readGithubContext(env = process.env) {
   let prNumber;
@@ -32282,7 +32478,7 @@ function readInputs(getInput = core_getInput) {
       fallback: undefined,
     }),
     monitorId: getInput("monitor-id").trim(),
-    timeoutSeconds: parseIntInput("timeout-seconds", getInput("timeout-seconds"), { min: 1, max: 21600, fallback: 600 }),
+    timeoutSeconds: parseIntInput("timeout-seconds", getInput("timeout-seconds"), { min: 1, max: 21600, fallback: 900 }),
     intervalSeconds: parseIntInput("interval-seconds", getInput("interval-seconds"), { min: 5, max: 3600, fallback: 15 }),
     upStatuses: parseList(getInput("up-statuses")).length ? parseList(getInput("up-statuses")) : ["Operational"],
     stableForSeconds: parseIntInput("stable-for-seconds", getInput("stable-for-seconds"), {
@@ -32290,6 +32486,7 @@ function readInputs(getInput = core_getInput) {
       max: 21600,
       fallback: 0,
     }),
+    waitForNewCheck: parseBoolInput("wait-for-new-check", getInput("wait-for-new-check"), true),
   };
 }
 
@@ -32299,6 +32496,16 @@ function readInputs(getInput = core_getInput) {
 async function run(deps = {}) {
   const c = deps.core ?? core_namespaceObject;
   let outputs = {};
+  // Read first, so a failure anywhere below honours it. With fail-on-error
+  // false (meant for an `if: always()` unmute after a green deploy) an error
+  // becomes a warning and the step stays green.
+  let failOnError = true;
+  try {
+    failOnError = parseBoolInput("fail-on-error", c.getInput("fail-on-error"), true);
+  } catch (err) {
+    c.setFailed(err.message);
+    return;
+  }
   try {
     // Mask the key before anything else can log it.
     const rawKey = c.getInput("api-key");
@@ -32329,7 +32536,10 @@ async function run(deps = {}) {
   } catch (err) {
     if (err instanceof OperationError) outputs = err.outputs;
     for (const [k, v] of Object.entries(outputs ?? {})) c.setOutput(k, v);
-    c.setFailed(err instanceof Error ? err.message : String(err));
+    const message = err instanceof Error ? err.message : String(err);
+    if (failOnError) c.setFailed(message);
+    else c.warning(`${message}
+(fail-on-error is false, so this step does not fail.)`);
     return;
   }
   for (const [k, v] of Object.entries(outputs)) c.setOutput(k, v);

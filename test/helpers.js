@@ -99,10 +99,11 @@ export function baseInputs(over = {}) {
     monitoringInterval: "",
     failureThreshold: undefined,
     monitorId: "",
-    timeoutSeconds: 600,
+    timeoutSeconds: 900,
     intervalSeconds: 15,
     upStatuses: ["Operational"],
     stableForSeconds: 0,
+    waitForNewCheck: true,
     ...over,
   };
 }

@@ -16,6 +16,10 @@ inputs:
     description: "Uptimely API base URL."
     required: false
     default: "https://app.getuptimely.com"
+  fail-on-error:
+    description: "Set to 'false' to report an error as a warning and keep the step green, e.g. for an if: always() unmute after a successful deploy."
+    required: false
+    default: "true"
 
   # mute / unmute
   monitor-ids:
@@ -34,13 +38,13 @@ inputs:
     description: "create-preview-monitor: the preview URL to monitor."
     required: false
   name:
-    description: "Monitor name. create-preview-monitor reuses a monitor with this name; delete-monitor and check look it up by name. Defaults to '<owner>/<repo> PR #<n> preview' on pull_request events."
+    description: "Monitor name. create-preview-monitor reuses, and delete-monitor deletes, only monitors with this name that carry the action's ownership marker for this repo and PR; check looks the monitor up by name. Defaults to '<owner>/<repo> PR #<n> preview' on pull_request events."
     required: false
   monitor-type:
     description: "create-preview-monitor: Website or API. delete-monitor: optional type filter for name lookups."
     required: false
   description:
-    description: "create-preview-monitor: monitor description."
+    description: "create-preview-monitor: monitor description. The ownership marker '[uptimely-action:<owner>/<repo>#<pr>]' is always appended."
     required: false
   monitoring-interval:
     description: "create-preview-monitor: cron-shaped check cadence, e.g. '*/5 * * * *' (Uptimely default)."
@@ -56,7 +60,7 @@ inputs:
   timeout-seconds:
     description: "check: fail if the monitor is not up within this many seconds."
     required: false
-    default: "600"
+    default: "900"
   interval-seconds:
     description: "check: seconds between polls (min 5). Each poll is one request from the project's monthly API allowance."
     required: false
@@ -66,15 +70,19 @@ inputs:
     required: false
     default: "Operational"
   stable-for-seconds:
-    description: "check: the monitor must stay up this long before the check passes. Set it to at least one check interval when gating on a just-created monitor, which starts out Operational before its first probe."
+    description: "check: the monitor must stay up this long (after a new check, see wait-for-new-check) before the check passes."
     required: false
     default: "0"
+  wait-for-new-check:
+    description: "check: only trust a status that Uptimely recorded after this step started (a new monitor reads Operational before its first check; a re-pointed one keeps its old URL's status). timeout-seconds should then be at least twice the monitor's check interval. Set 'false' for monitor types no probe checks."
+    required: false
+    default: "true"
 
 outputs:
   monitor-id:
-    description: "create-preview-monitor / delete-monitor / check: the monitor id."
+    description: "create-preview-monitor / check: the monitor id. delete-monitor: the first id deleted."
   monitor-ids:
-    description: "mute / unmute: comma-separated ids of the monitors that were muted / unmuted."
+    description: "mute / unmute / delete-monitor: comma-separated ids of the monitors that were muted / unmuted / deleted."
   monitor-name:
     description: "create-preview-monitor: the monitor name used."
   created:
