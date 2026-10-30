@@ -1,6 +1,6 @@
 name: "Uptimely Monitors"
 description: "Mute Uptimely monitors during a deploy, create a monitor per preview URL, and gate a job on a monitor being up."
-author: "Devino"
+author: "Devino Solutions"
 branding:
   icon: "activity"
   color: "green"

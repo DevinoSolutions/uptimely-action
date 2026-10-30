@@ -240,19 +240,17 @@ npm run build     # bundles src/ into dist/ with @vercel/ncc
 
 `dist/` is committed because GitHub runs the action straight from the repository. CI fails if `dist/` does not match the source.
 
-## Publishing (owner step)
+## Releasing
 
-The steps below are not done. They need the owner (Devino org admin):
+Releases follow semantic versioning. After a change lands on `main` with CI green, tag it and move the major tag so `@v1` picks it up:
 
-1. **Create the public repository** `DevinoSolutions/uptimely-action` and push `main`. The Marketplace only lists actions from public repos with a single `action.yml` at the root.
-2. **Choose a license** and add a `LICENSE` file before the first release. The repo has none yet; this is a legal decision for the owner.
-3. **Check that the action name is free.** `name:` in `action.yml` ("Uptimely Monitors") must not match an existing Marketplace action, a category, or a GitHub user or org that Devino does not own. Rename it if the release page complains.
-4. **Accept the GitHub Marketplace Developer Agreement** for the DevinoSolutions org. An org owner does this from the link on the release page. Two-factor authentication must be on for the publishing account.
-5. **Release v1.0.0 with "Publish this Action to the GitHub Marketplace" ticked.** Pick a primary category (Monitoring; second category Deployment). Then create or move the major tag so `@v1` works:
-   ```sh
-   git tag -a v1.0.0 -m "v1.0.0" && git push origin v1.0.0
-   git tag -f v1 v1.0.0 && git push -f origin v1
-   ```
-6. **Live-test before announcing it.** Run the three example workflows in a test repo against a Pro Uptimely project that has write operations on. Listing is immediate and GitHub does not review it, so this test is the only review.
+```sh
+git tag -a v1.2.3 -m "v1.2.3" && git push origin v1.2.3
+git tag -f v1 v1.2.3 && git push -f origin v1
+```
 
-Docs: <https://docs.github.com/en/actions/how-tos/create-and-publish-actions/publish-in-github-marketplace>
+Then create the GitHub Release for the new tag, which updates the Marketplace listing.
+
+## License
+
+[MIT](LICENSE)

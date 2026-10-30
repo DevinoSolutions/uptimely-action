@@ -1,0 +1,47 @@
+name: Live test
+
+# Runs the action against Uptimely production with a real project API key.
+# Read-only: `check` only reads one monitor, so nothing is created or changed.
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Which copy of the action to run: 'local' (this commit) or 'published' (DevinoSolutions/uptimely-action@v1)"
+        type: choice
+        options: [local, published]
+        default: local
+
+permissions:
+  contents: read
+
+jobs:
+  check-local:
+    if: inputs.source == 'local'
+    name: check (this commit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        uses: ./
+        with:
+          operation: check
+          api-key: ${{ secrets.UPTIMELY_API_KEY }}
+          monitor-id: ${{ vars.UPTIMELY_TEST_MONITOR_ID }}
+          timeout-seconds: 900
+          interval-seconds: 15
+      - run: echo "Monitor ${{ steps.check.outputs.monitor-id }} is ${{ steps.check.outputs.status }}"
+
+  check-published:
+    if: inputs.source == 'published'
+    name: check (DevinoSolutions/uptimely-action@v1)
+    runs-on: ubuntu-latest
+    steps:
+      - id: check
+        uses: DevinoSolutions/uptimely-action@v1
+        with:
+          operation: check
+          api-key: ${{ secrets.UPTIMELY_API_KEY }}
+          monitor-id: ${{ vars.UPTIMELY_TEST_MONITOR_ID }}
+          timeout-seconds: 900
+          interval-seconds: 15
+      - run: echo "Monitor ${{ steps.check.outputs.monitor-id }} is ${{ steps.check.outputs.status }}"
